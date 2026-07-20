@@ -1,0 +1,1562 @@
+# RAG + FastAPI + ChromaDB + Streamlit 项目学习笔记
+
+## 1. 项目背景与学习目标
+
+本项目复现的是一个基于 **RAG（Retrieval-Augmented Generation，检索增强生成）** 的 PDF 问答系统。项目使用 **FastAPI** 作为后端服务，使用 **Streamlit** 作为前端页面，使用 **ChromaDB** 作为向量数据库，使用 **LangChain** 组织 RAG 流程，并支持 Groq / Gemini 等大模型提供商。
+
+这个项目的核心价值不在于模型算法本身，而在于它展示了一个较完整的 RAG 应用工程骨架。通过学习该项目，可以掌握：
+
+- RAG 系统的完整工程流程；
+- PDF 文档如何进入知识库；
+- 文本如何切块、向量化并写入向量库；
+- 用户问题如何通过向量库检索相关 chunk；
+- 检索结果如何与 prompt 组合后交给大模型生成答案；
+- FastAPI 后端如何设计接口；
+- Streamlit 前端如何调用后端；
+- ChromaDB 如何作为本地持久化向量库使用；
+- 如何调试 RAG 系统中的“检索问题”和“生成问题”。
+
+项目的典型流程如下：
+
+```text
+上传 PDF
+  ↓
+保存 PDF 文件
+  ↓
+解析 PDF 文本
+  ↓
+文本切块 chunk
+  ↓
+Embedding 向量化
+  ↓
+写入 ChromaDB
+  ↓
+用户提问
+  ↓
+Retriever 检索相关 chunk
+  ↓
+Prompt 拼接 context + question
+  ↓
+LLM 生成回答
+  ↓
+Streamlit 展示结果
+```
+
+------
+
+## 2. 项目整体架构
+
+该项目采用前后端分离的结构：
+
+```text
+rag-bot-fastapi
+├── client                         # 前端 Streamlit
+│   ├── app.py                     # 前端入口
+│   ├── components                 # 页面组件
+│   │   ├── sidebar.py             # 侧边栏：模型选择、PDF 上传
+│   │   ├── chat.py                # 聊天组件
+│   │   └── inspector.py           # 向量库检索检查器
+│   ├── utils
+│   │   └── api.py                 # 前端调用后端 API 的封装
+│   └── state
+│       └── session.py             # Streamlit session_state 状态管理
+│
+└── server                         # 后端 FastAPI
+    ├── main.py                    # FastAPI 应用入口
+    ├── api
+    │   ├── routes.py              # 后端接口定义
+    │   └── schemas.py             # 请求体/响应体模型
+    ├── core
+    │   ├── document_processor.py  # PDF 保存、读取、切块
+    │   ├── vector_database.py     # Embedding + ChromaDB 操作
+    │   └── llm_chain_factory.py   # Prompt + LLM + RAG Chain
+    └── config
+        └── settings.py            # 模型配置、路径配置、API Key 配置
+```
+
+可以把整个系统理解成四层：
+
+```text
+前端交互层：Streamlit
+  ↓
+后端接口层：FastAPI routes
+  ↓
+核心业务层：document_processor / vector_database / llm_chain_factory
+  ↓
+外部能力层：ChromaDB / Embedding 模型 / LLM API
+```
+
+------
+
+## 3. 技术栈说明
+
+| 技术              | 在项目中的作用          |
+| ----------------- | ----------------------- |
+| Python            | 项目主语言              |
+| FastAPI           | 构建后端 REST API       |
+| Uvicorn           | 启动 FastAPI 服务       |
+| Streamlit         | 构建前端交互界面        |
+| LangChain         | 编排 RAG 流程           |
+| ChromaDB          | 本地向量数据库          |
+| PyPDFLoader       | 读取 PDF 内容           |
+| TokenTextSplitter | 将长文本切成 chunks     |
+| Embedding 模型    | 将文本转换为向量        |
+| Groq / Gemini     | 调用大模型生成回答      |
+| `.env`            | 保存 API Key 等敏感配置 |
+
+------
+
+## 4. 项目运行流程
+
+后端启动：
+
+```bash
+cd server
+conda activate ragbot
+python -m uvicorn main:app --reload
+```
+
+后端启动后访问：
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+可以看到 FastAPI 自动生成的 Swagger API 文档。
+
+前端启动：
+
+```bash
+cd client
+conda activate ragbot
+streamlit run app.py
+```
+
+前端默认运行在：
+
+```text
+http://localhost:8501
+```
+
+注意：直接访问 `http://127.0.0.1:8000/` 出现 404 是正常的，因为后端没有定义首页 `/` 路由。应访问 `/docs` 或 `/health`。
+
+------
+
+## 5. `.env` 配置
+
+`.env` 文件应放在后端 `server` 目录下：
+
+```text
+rag-bot-fastapi/server/.env
+```
+
+示例：
+
+```env
+GROQ_API_KEY=你的groq_key
+GOOGLE_API_KEY=你的google_key
+```
+
+注意：
+
+```text
+GROQ_API_KEY      正确
+GROQ API KEY      错误
+
+GOOGLE_API_KEY    正确
+GOOGLE API KEY    错误
+```
+
+变量名必须使用英文下划线 `_`，不能使用空格。修改 `.env` 后需要重启后端服务。
+
+------
+
+## 6. RAG 基础流程理解
+
+RAG 是 Retrieval-Augmented Generation，即“检索增强生成”。
+
+普通 LLM 问答流程是：
+
+```text
+用户问题 → LLM → 回答
+```
+
+RAG 问答流程是：
+
+```text
+用户问题
+  ↓
+检索器从知识库中找相关内容
+  ↓
+把相关内容作为 context 放进 prompt
+  ↓
+LLM 根据 context 生成回答
+```
+
+RAG 的优势是：
+
+1. 可以让模型基于本地文档回答；
+2. 不需要重新训练大模型；
+3. 可以动态更新知识库；
+4. 可以减少模型幻觉；
+5. 可以返回引用来源，提升可信度。
+
+------
+
+## 7. 文档入库流程
+
+文档入库对应的是上传 PDF 后构建向量库的过程。
+
+核心函数通常是：
+
+```python
+async def upsert_vectorstore_from_pdfs(uploaded_files, model_provider):
+    file_paths = await save_uploaded_file(uploaded_files)
+    docs = load_documents_from_paths(file_paths)
+    chunks = split_documents_to_chunks(docs)
+    embedding = get_embeddings(model_provider)
+
+    persist_path = VECTORSTORE_DIRECTORY[model_provider]
+
+    if vectorstore_exists(persist_path):
+        vectorstore = Chroma(
+            persist_directory=persist_path,
+            embedding_function=embedding
+        )
+        vectorstore.add_documents(chunks)
+    else:
+        vectorstore = Chroma.from_documents(
+            documents=chunks,
+            embedding=embedding,
+            persist_directory=persist_path
+        )
+
+    return vectorstore
+```
+
+### 7.1 `save_uploaded_file()`
+
+作用：把前端上传的 `UploadFile` 对象保存到本地磁盘。
+
+前端上传的文件本质上不是普通路径，而是一个临时文件对象。后端需要先将它保存到本地，后续 PDF Loader 才能读取。
+
+输入：
+
+```text
+UploadFile 列表
+```
+
+输出：
+
+```text
+文件路径列表，例如：
+["./data/uploads/test.pdf"]
+```
+
+### 7.2 `load_documents_from_paths()`
+
+作用：根据文件路径读取 PDF 内容。
+
+一般使用：
+
+```python
+PyPDFLoader
+```
+
+读取后得到 LangChain 的 `Document` 对象列表。
+
+一个 `Document` 通常包含：
+
+```python
+Document(
+    page_content="PDF 中的文本内容",
+    metadata={
+        "source": "文件路径",
+        "page": 页码
+    }
+)
+```
+
+### 7.3 `split_documents_to_chunks()`
+
+作用：将长文本切分为 chunks。
+
+为什么要切块？
+
+1. PDF 可能很长，LLM 上下文窗口有限；
+2. 向量检索需要以小片段为单位；
+3. chunk 太大，检索结果可能不精确；
+4. chunk 太小，语义可能不完整。
+
+常见参数：
+
+```python
+chunk_size = 500
+chunk_overlap = 50
+```
+
+含义：
+
+| 参数            | 含义                  |
+| --------------- | --------------------- |
+| `chunk_size`    | 每个 chunk 的最大长度 |
+| `chunk_overlap` | 相邻 chunk 的重叠部分 |
+
+`chunk_overlap` 的意义是避免文本被硬切后上下文断裂。
+
+### 7.4 `get_embeddings()`
+
+作用：根据模型提供商选择 embedding 模型。
+
+Embedding 的作用是将文本转换成向量，例如：
+
+```text
+"SQL 注入是一种 Web 漏洞"
+```
+
+转换成：
+
+```text
+[0.12, -0.44, 0.78, ...]
+```
+
+向量可以用于相似度搜索。用户问题也会被转成向量，然后和知识库中的 chunk 向量比较相似度。
+
+### 7.5 `Chroma.from_documents()`
+
+作用：第一次创建向量库，并将 chunks 写入 ChromaDB。
+
+```python
+Chroma.from_documents(
+    documents=chunks,
+    embedding=embedding,
+    persist_directory=persist_path
+)
+```
+
+这一步会自动完成：
+
+```text
+chunk 文本 → embedding 向量 → 写入 ChromaDB
+```
+
+### 7.6 `vectorstore.add_documents()`
+
+作用：向已有向量库追加新的 chunks。
+
+如果之前已经上传过 PDF，再上传新 PDF 时，不需要新建向量库，而是向原有向量库追加内容。
+
+------
+
+## 8. 向量库 VectorStore 与检索器 Retriever
+
+### 8.1 VectorStore 是什么？
+
+`vectorstore` 是向量数据库对象。
+
+在本项目中，通常是 ChromaDB 的封装对象。
+
+它里面保存：
+
+```text
+chunk 文本
+chunk 的 embedding 向量
+metadata 信息
+```
+
+可以理解成“知识库本体”。
+
+### 8.2 Retriever 是什么？
+
+`retriever` 是检索器。
+
+它通常由 vectorstore 转换得到：
+
+```python
+retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+```
+
+含义是：
+
+```text
+从 vectorstore 创建一个检索器，每次检索最相关的 3 个 chunks。
+```
+
+### 8.3 两者区别
+
+| 对象          | 类比       | 作用                         |
+| ------------- | ---------- | ---------------------------- |
+| `vectorstore` | 图书馆     | 存放所有文档片段和向量       |
+| `retriever`   | 图书管理员 | 根据问题从图书馆里找相关资料 |
+
+一句话总结：
+
+```text
+vectorstore 负责存，retriever 负责查。
+```
+
+------
+
+## 9. RAG Chain 结构
+
+RAG Chain 是将检索器、Prompt 和 LLM 串联起来的完整问答链。
+
+典型结构：
+
+```python
+def build_llm_chain(model_provider, model_name, vectorstore):
+    prompt = get_prompt()
+    llm = get_llm(model_provider, model_name)
+
+    retriever = vectorstore.as_retriever(
+        search_kwargs={"k": 3}
+    )
+
+    document_chain = create_stuff_documents_chain(
+        llm,
+        prompt
+    )
+
+    retrieval_chain = create_retrieval_chain(
+        retriever,
+        document_chain
+    )
+
+    return retrieval_chain
+```
+
+完整流程：
+
+```text
+用户问题 input
+  ↓
+retriever 从 vectorstore 中检索相关 chunks
+  ↓
+chunks 作为 context
+  ↓
+context + input 填入 prompt
+  ↓
+LLM 生成 answer
+```
+
+### 9.1 `prompt`
+
+Prompt 决定模型如何根据上下文回答。
+
+典型 RAG prompt：
+
+```text
+请根据以下上下文回答问题。
+如果上下文中没有答案，请回答“文档中没有找到相关信息”。
+
+上下文：
+{context}
+
+问题：
+{input}
+```
+
+其中：
+
+| 占位符      | 含义                      |
+| ----------- | ------------------------- |
+| `{context}` | retriever 检索出的 chunks |
+| `{input}`   | 用户问题                  |
+
+### 9.2 `document_chain`
+
+`document_chain` 负责把检索到的文档片段塞进 prompt，再交给 LLM。
+
+`create_stuff_documents_chain()` 中的 `stuff` 可以理解为“直接塞进去”。
+
+### 9.3 `retrieval_chain`
+
+`retrieval_chain` 是完整 RAG 流程。
+
+它负责：
+
+```text
+先检索，再生成。
+```
+
+当执行：
+
+```python
+chain.invoke({"input": message})
+```
+
+内部会发生：
+
+```text
+1. 读取用户问题 input；
+2. Retriever 检索相关 chunks；
+3. 将 chunks 合并为 context；
+4. 将 context 和 input 填入 prompt；
+5. 调用 LLM；
+6. 返回 answer。
+```
+
+返回结果一般类似：
+
+```python
+{
+    "input": "用户问题",
+    "context": [Document(...), Document(...)],
+    "answer": "模型生成的回答"
+}
+```
+
+------
+
+## 10. `/chat` 接口分析
+
+聊天接口是用户提问的后端入口。
+
+核心代码：
+
+```python
+@router.post("/chat", response_model=StandardAPIResponse)
+async def chat(request: ChatRequest):
+    try:
+        message = request.message
+        model_name = request.model_name
+        model_provider = request.model_provider.lower()
+
+        if model_provider not in MODEL_OPTIONS:
+            return StandardAPIResponse(
+                status="error",
+                message="Invalid model provider."
+            )
+
+        if model_name not in MODEL_OPTIONS[model_provider]["models"]:
+            return StandardAPIResponse(
+                status="error",
+                message="Invalid model name."
+            )
+
+        vectorstore = load_vectorstore(model_provider)
+        chain = build_llm_chain(model_provider, model_name, vectorstore)
+
+        if not chain:
+            return StandardAPIResponse(
+                status="error",
+                message="Failed to create LLM chain."
+            )
+
+        response = chain.invoke({"input": message})["answer"]
+
+        return StandardAPIResponse(
+            status="success",
+            data=response
+        )
+
+    except Exception as e:
+        return StandardAPIResponse(
+            status="error",
+            message=str(e)
+        )
+```
+
+### 10.1 这段代码的流程
+
+```text
+接收用户问题
+  ↓
+读取模型名称和 provider
+  ↓
+校验 provider 是否合法
+  ↓
+校验模型名称是否属于该 provider
+  ↓
+加载对应向量库
+  ↓
+构建 RAG Chain
+  ↓
+执行 chain.invoke()
+  ↓
+返回 answer
+```
+
+### 10.2 核心三行
+
+```python
+vectorstore = load_vectorstore(model_provider)
+```
+
+加载知识库。
+
+```python
+chain = build_llm_chain(model_provider, model_name, vectorstore)
+```
+
+构建 RAG 问答链。
+
+```python
+response = chain.invoke({"input": message})["answer"]
+```
+
+执行 RAG 问答并取出最终答案。
+
+------
+
+## 11. Inspector 是什么？
+
+Inspector 是“向量库检索结果检查器”。
+
+它的作用不是生成答案，而是展示用户问题在 ChromaDB 中检索到了哪些 chunks。
+
+### 11.1 Inspector 的流程
+
+```text
+用户输入查询
+  ↓
+前端调用 /vector_store/search
+  ↓
+后端调用 find_similar_chunks()
+  ↓
+ChromaDB similarity_search
+  ↓
+返回相关 chunks
+  ↓
+前端展示检索结果
+```
+
+### 11.2 Inspector 和 Chat 的区别
+
+| 功能           | Chat       | Inspector        |
+| -------------- | ---------- | ---------------- |
+| 是否调用 LLM   | 是         | 否               |
+| 是否生成答案   | 是         | 否               |
+| 是否检索向量库 | 是         | 是               |
+| 主要用途       | 给用户回答 | 给开发者调试检索 |
+| 调试价值       | 看最终效果 | 判断检索是否准确 |
+
+### 11.3 为什么 Inspector 很重要？
+
+RAG 的错误通常分两类：
+
+```text
+1. 检索错了；
+2. 检索对了，但 LLM 回答错了。
+```
+
+Inspector 用来判断第一类问题。
+
+如果 Inspector 返回的 chunks 不包含答案，说明问题在：
+
+```text
+chunk 切分
+embedding 模型
+Top-k 设置
+文档解析质量
+query 表达
+向量库内容
+```
+
+如果 Inspector 返回的 chunks 包含答案，但 Chat 回答不好，说明问题可能在：
+
+```text
+prompt 设计
+LLM 能力
+context 拼接方式
+回答格式约束
+```
+
+------
+
+## 12. 前端 Streamlit 代码理解
+
+前端主要负责：
+
+```text
+1. 展示页面；
+2. 上传 PDF；
+3. 选择 provider 和模型；
+4. 输入聊天问题；
+5. 调用后端 API；
+6. 展示回答和检索结果。
+```
+
+### 12.1 `client/app.py`
+
+这是前端入口，负责组织页面结构。
+
+它一般会调用：
+
+```text
+sidebar
+chat
+inspector
+session state
+```
+
+### 12.2 `client/components/sidebar.py`
+
+主要负责：
+
+```text
+模型 provider 选择
+模型名称选择
+PDF 文件上传
+Submit 按钮
+```
+
+用户点击 Submit 后，会调用 API 函数，把 PDF 文件发送给后端。
+
+### 12.3 `client/components/chat.py`
+
+主要负责：
+
+```text
+展示历史对话
+接收用户输入
+调用后端 /chat
+显示模型回答
+```
+
+核心组件：
+
+```python
+st.chat_input()
+st.chat_message()
+st.session_state
+```
+
+### 12.4 `client/components/inspector.py`
+
+主要负责：
+
+```text
+输入检索 query
+调用 /vector_store/search
+展示返回的 chunks
+```
+
+这是 RAG 调试时非常重要的页面。
+
+### 12.5 `client/utils/api.py`
+
+这是前端和后端的桥梁。
+
+它一般封装：
+
+```text
+get_supported_llm()
+get_supported_models()
+upload_and_process_pdfs()
+chat()
+get_vectorstore_similarity_search()
+```
+
+前端不是直接调用后端 Python 函数，而是通过 HTTP 请求调用 FastAPI 接口。
+
+------
+
+## 13. 后端 FastAPI 代码理解
+
+### 13.1 `main.py`
+
+后端入口，通常负责：
+
+```text
+创建 FastAPI app
+注册 router
+配置启动事件
+初始化向量库
+```
+
+### 13.2 `api/routes.py`
+
+定义后端接口。
+
+常见接口：
+
+```text
+GET  /health
+GET  /llm
+GET  /llm/{model_provider}
+POST /upload_and_process_pdfs
+POST /vector_store/search
+POST /chat
+```
+
+### 13.3 `api/schemas.py`
+
+定义请求体和响应体。
+
+例如：
+
+```python
+class ChatRequest(BaseModel):
+    message: str
+    model_name: str
+    model_provider: str
+```
+
+统一响应：
+
+```python
+class StandardAPIResponse(BaseModel):
+    status: str
+    message: Optional[str] = None
+    data: Optional[Any] = None
+```
+
+统一响应格式的好处是前端处理简单：
+
+```text
+status == success → 显示 data
+status == error → 显示 message
+```
+
+------
+
+## 14. 关键源码主线
+
+### 14.1 上传 PDF 主线
+
+```text
+client/components/sidebar.py
+  ↓
+client/utils/api.py
+  ↓ POST /upload_and_process_pdfs
+server/api/routes.py
+  ↓
+upsert_vectorstore_from_pdfs()
+  ↓
+save_uploaded_file()
+  ↓
+load_documents_from_paths()
+  ↓
+split_documents_to_chunks()
+  ↓
+get_embeddings()
+  ↓
+Chroma.from_documents() 或 add_documents()
+```
+
+### 14.2 用户提问主线
+
+```text
+client/components/chat.py
+  ↓
+client/utils/api.py
+  ↓ POST /chat
+server/api/routes.py
+  ↓
+load_vectorstore()
+  ↓
+build_llm_chain()
+  ↓
+vectorstore.as_retriever()
+  ↓
+create_retrieval_chain()
+  ↓
+chain.invoke()
+  ↓
+返回 answer
+```
+
+### 14.3 Inspector 主线
+
+```text
+client/components/inspector.py
+  ↓
+client/utils/api.py
+  ↓ POST /vector_store/search
+server/api/routes.py
+  ↓
+find_similar_chunks()
+  ↓
+vectorstore.similarity_search()
+  ↓
+返回 chunks
+```
+
+------
+
+## 15. 项目中的重要参数
+
+| 参数                | 位置                                 | 作用                      |
+| ------------------- | ------------------------------------ | ------------------------- |
+| `chunk_size`        | `document_processor.py`              | 控制 chunk 大小           |
+| `chunk_overlap`     | `document_processor.py`              | 控制 chunk 重叠长度       |
+| `k`                 | `llm_chain_factory.py`               | 控制检索返回的 chunk 数量 |
+| `persist_directory` | `settings.py` / `vector_database.py` | 控制 ChromaDB 存储路径    |
+| `model_provider`    | 前端和后端                           | 控制使用 Groq / Gemini    |
+| `model_name`        | 前端和后端                           | 控制具体 LLM              |
+| `embedding`         | `vector_database.py`                 | 控制文本向量化模型        |
+
+------
+
+## 16. 常见问题与调试经验
+
+### 16.1 `No module named 'langchain.document_loaders'`
+
+原因：新版 LangChain 拆分了模块路径。
+
+旧写法：
+
+```python
+from langchain.document_loaders import PyPDFLoader
+```
+
+新写法：
+
+```python
+from langchain_community.document_loaders import PyPDFLoader
+```
+
+如果 `TokenTextSplitter` 报错，可以改为：
+
+```python
+from langchain_text_splitters import TokenTextSplitter
+```
+
+### 16.2 `Cannot connect to proxy`
+
+原因：pip 或系统环境变量中存在错误代理配置。
+
+排查：
+
+```bash
+set | findstr /i proxy
+pip config list -v
+```
+
+解决：
+
+```bash
+set HTTP_PROXY=
+set HTTPS_PROXY=
+set ALL_PROXY=
+set GOPROXY=
+```
+
+或者使用：
+
+```bash
+python -m pip --isolated install 包名
+```
+
+### 16.3 `No matching distribution found for langchain-google-genai`
+
+原因：Python 版本过低。
+
+解决：使用 Python 3.10。
+
+```bash
+conda create -n ragbot python=3.10 -y
+conda activate ragbot
+```
+
+### 16.4 FastAPI 后端访问 `/` 显示 404
+
+正常现象。因为项目没有定义 `/` 首页。
+
+应该访问：
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+### 16.5 Gemini SSL 错误
+
+如果出现：
+
+```text
+[SSL: UNEXPECTED_EOF_WHILE_READING]
+```
+
+原因通常是 Python 访问 Google API 的网络连接不稳定、代理不兼容或证书问题。
+
+快速解决：先使用 Groq 跑通项目，不要先纠结 Gemini。
+
+------
+
+## 17. 项目优点
+
+1. 前后端分离清晰；
+2. RAG 流程完整；
+3. 使用 ChromaDB 做本地持久化；
+4. 使用 FastAPI 提供统一接口；
+5. 使用 Streamlit 快速构建交互页面；
+6. 提供 Inspector，便于调试检索结果；
+7. 支持多模型 provider；
+8. 比单文件 demo 更接近实际工程结构。
+
+------
+
+## 18. 项目不足与改进方向
+
+### 18.1 没有文档去重
+
+如果用户重复上传同一个 PDF，chunks 会重复写入向量库。
+
+改进：
+
+```text
+使用文件 hash 去重；
+使用 source + page + chunk_index 去重。
+```
+
+### 18.2 没有用户隔离
+
+当前项目可能只按 provider 区分向量库。
+
+如果做成真正系统，应该按用户或项目隔离：
+
+```text
+user_id / project_id / collection_name
+```
+
+### 18.3 LLM provider 和 embedding provider 耦合
+
+当前项目可能通过 `model_provider` 决定向量库路径和 embedding 模型。
+
+更合理的设计是：
+
+```text
+embedding_provider 负责向量库
+llm_provider 负责回答生成
+```
+
+因为 RAG 中 embedding 和 LLM 是两个不同模块。
+
+### 18.4 回答没有引用来源
+
+当前 `/chat` 通常只返回：
+
+```python
+result["answer"]
+```
+
+更好的设计是返回：
+
+```text
+answer
+source
+page
+chunk
+score
+```
+
+这样可以提升可信度。
+
+### 18.5 缺少检索评分
+
+Inspector 如果只返回 chunk 内容，不返回 similarity score，就不方便判断相关性强弱。
+
+改进：
+
+```python
+similarity_search_with_score()
+```
+
+### 18.6 没有 rerank
+
+初步向量检索可能召回不够精确。
+
+可以加入 rerank 模型，对 Top-k chunks 重新排序。
+
+### 18.7 没有权限控制
+
+如果做成真实 Web 系统，需要考虑：
+
+```text
+用户登录
+文件权限
+知识库隔离
+API Key 安全
+上传文件大小限制
+恶意 PDF 检测
+```
+
+------
+
+## 19. 如何改造成 Web 漏洞知识库系统
+
+当前项目可以作为“基于 RAG 的 Web 漏洞知识库与 PoC 辅助分析系统”的基础骨架。
+
+### 19.1 知识库内容
+
+可以上传：
+
+```text
+Web 安全教材
+漏洞分析报告
+CVE 描述
+漏洞复现文档
+修复建议文档
+代码审计笔记
+PoC 说明文档
+```
+
+### 19.2 Metadata 扩展
+
+建议为 chunks 增加：
+
+```python
+metadata = {
+    "source": "文件名",
+    "page": 页码,
+    "chunk_index": chunk编号,
+    "vuln_type": "SQL Injection",
+    "cve": "CVE-xxxx-xxxx",
+    "risk_level": "High",
+    "component": "影响组件",
+    "source_type": "CVE / paper / blog / report"
+}
+```
+
+### 19.3 Prompt 改造
+
+可以改成：
+
+```text
+你是一个 Web 漏洞分析助手。
+请只根据给定知识库内容回答。
+回答时按照以下结构：
+1. 漏洞原理
+2. 触发条件
+3. 影响范围
+4. 检测思路
+5. 修复建议
+6. 参考来源
+
+如果知识库中没有相关信息，请回答“知识库中没有找到相关依据”。
+```
+
+### 19.4 功能扩展
+
+可以增加：
+
+```text
+按漏洞类型检索
+按 CVE 编号检索
+按风险等级过滤
+代码片段风险分析
+修复建议生成
+引用来源展示
+报告导出
+```
+
+注意：系统定位应是安全学习、漏洞分析和修复辅助，不应设计成自动攻击工具。
+
+------
+
+# 20. 面试可能问题与参考回答
+
+## 20.1 项目整体类问题
+
+### Q1：你这个项目主要做了什么？
+
+参考回答：
+
+本项目是一个基于 RAG 的 PDF 问答系统。用户可以上传 PDF，系统会解析 PDF 内容，将文本切分成 chunks，然后通过 embedding 模型转成向量并存入 ChromaDB。用户提问时，系统会使用 retriever 从 ChromaDB 中检索相关文档片段，再将检索结果和用户问题一起放入 prompt，交给大模型生成回答。项目后端使用 FastAPI，前端使用 Streamlit，向量库使用 ChromaDB，RAG 流程由 LangChain 编排。
+
+------
+
+### Q2：为什么选择 RAG，而不是直接把问题发给大模型？
+
+参考回答：
+
+直接调用大模型时，模型只能依赖自身训练知识，无法知道用户上传的本地 PDF 内容，而且容易产生幻觉。RAG 会先从本地知识库中检索相关内容，再让大模型基于这些内容回答，因此可以让回答结合私有文档，减少幻觉，并且知识库可以动态更新，不需要重新训练模型。
+
+------
+
+### Q3：这个项目的整体架构是什么？
+
+参考回答：
+
+项目采用前后端分离架构。前端使用 Streamlit，负责页面展示、PDF 上传、聊天输入和检索结果展示。后端使用 FastAPI，提供上传 PDF、聊天问答、向量库检索等接口。核心业务层包括文档处理模块、向量数据库模块和 RAG Chain 构建模块。ChromaDB 用于持久化存储文档向量，LangChain 用于组织 retriever、prompt 和 LLM。
+
+------
+
+### Q4：这个项目中前端和后端是如何通信的？
+
+参考回答：
+
+前端 Streamlit 并不直接调用后端函数，而是通过 HTTP 请求调用 FastAPI 接口。比如上传 PDF 时，前端通过 POST 请求调用 `/upload_and_process_pdfs`；用户聊天时，通过 POST 请求调用 `/chat`；Inspector 检索时，通过 POST 请求调用 `/vector_store/search`。这些请求封装在 `client/utils/api.py` 中。
+
+------
+
+## 20.2 RAG 原理类问题
+
+### Q5：RAG 的完整流程是什么？
+
+参考回答：
+
+RAG 流程包括两个阶段。第一阶段是知识库构建：上传文档、解析文本、切块、向量化、写入向量数据库。第二阶段是问答：用户提问后，系统将问题向量化，在向量库中检索相关 chunks，将这些 chunks 作为上下文填入 prompt，再交给大模型生成回答。
+
+------
+
+### Q6：为什么要进行文本切块？
+
+参考回答：
+
+因为文档通常很长，无法直接放入大模型上下文窗口。同时，向量检索需要以相对较小的语义单元为单位。切块后，每个 chunk 都可以单独向量化并检索。这样用户提问时，系统可以只召回最相关的几个片段，提高效率和准确性。
+
+------
+
+### Q7：chunk_size 和 chunk_overlap 分别有什么作用？
+
+参考回答：
+
+`chunk_size` 控制每个文本片段的长度。太小会导致语义不完整，太大则可能包含过多无关内容。`chunk_overlap` 控制相邻 chunk 的重叠部分，可以避免重要语义刚好被切断。合理设置这两个参数有助于提高检索质量。
+
+------
+
+### Q8：Embedding 是什么？
+
+参考回答：
+
+Embedding 是将文本转换为向量的过程。文本向量可以表达语义信息，语义相近的文本在向量空间中距离也更近。RAG 系统通过 embedding 将文档 chunks 和用户问题转换为向量，然后进行相似度搜索。
+
+------
+
+### Q9：向量检索是怎么工作的？
+
+参考回答：
+
+系统先将用户问题转换为向量，然后与 ChromaDB 中保存的 chunk 向量进行相似度计算，找出最相似的 Top-k 个 chunks。这些 chunks 就被认为是与用户问题最相关的上下文，后续会交给大模型生成回答。
+
+------
+
+### Q10：Top-k 是什么？k 取值过大或过小有什么影响？
+
+参考回答：
+
+Top-k 表示每次检索返回最相关的 k 个 chunks。k 太小可能导致召回的信息不完整；k 太大可能引入无关内容，干扰大模型回答。需要根据文档长度、chunk 大小和问题复杂度进行实验调整。
+
+------
+
+## 20.3 VectorStore 与 Retriever 类问题
+
+### Q11：vectorstore 和 retriever 有什么区别？
+
+参考回答：
+
+vectorstore 是向量数据库对象，负责存储文档 chunks、embedding 向量和 metadata。retriever 是基于 vectorstore 创建的检索器，负责根据用户问题从 vectorstore 中检索相关 chunks。简单来说，vectorstore 负责存，retriever 负责查。
+
+------
+
+### Q12：为什么不直接用 vectorstore，而要转成 retriever？
+
+参考回答：
+
+可以直接使用 `vectorstore.similarity_search()` 做检索，但 LangChain 的 RAG Chain 需要一个标准化的 retriever 接口。因此通常通过 `vectorstore.as_retriever()` 将向量库包装成检索器，再交给 `create_retrieval_chain()` 使用。
+
+------
+
+### Q13：ChromaDB 在项目中起什么作用？
+
+参考回答：
+
+ChromaDB 是本地向量数据库，用来持久化保存 PDF chunks 的向量、文本内容和 metadata。用户上传 PDF 后，系统会将切分后的 chunks 向量化并写入 ChromaDB。用户提问时，系统从 ChromaDB 中检索相关 chunks。
+
+------
+
+### Q14：persist_directory 是什么？
+
+参考回答：
+
+`persist_directory` 是 ChromaDB 的本地持久化目录。它决定向量库数据保存在哪个路径。使用持久化目录后，即使后端服务重启，已经写入的向量库数据仍然可以重新加载。
+
+------
+
+## 20.4 RAG Chain 类问题
+
+### Q15：RAG Chain 的结构是什么？
+
+参考回答：
+
+RAG Chain 由 retriever、prompt、LLM 和 document_chain 组成。retriever 负责从向量库中检索相关 chunks；document_chain 负责将这些 chunks 填入 prompt；LLM 根据 prompt 和 context 生成回答；retrieval_chain 将检索和生成两个步骤串起来，形成完整 RAG 问答流程。
+
+------
+
+### Q16：`chain.invoke({"input": message})` 做了什么？
+
+参考回答：
+
+它启动完整 RAG 流程。首先读取用户问题 input，然后 retriever 根据问题从向量库中检索相关 chunks，接着这些 chunks 被作为 context 填入 prompt，最后调用大模型生成 answer。返回结果通常包含 input、context 和 answer。
+
+------
+
+### Q17：为什么这里传入的 key 是 `"input"`？
+
+参考回答：
+
+因为 LangChain 的 `create_retrieval_chain()` 默认使用 `input` 作为用户问题字段。Prompt 中也通常用 `{input}` 作为占位符。如果要改成 `question`，需要同步修改 chain 和 prompt 的字段配置。
+
+------
+
+### Q18：`create_stuff_documents_chain()` 是什么？
+
+参考回答：
+
+它会将检索到的多个 Document 直接合并后塞入 prompt 的 context 部分，再交给 LLM。`stuff` 可以理解为“直接塞入”。这种方式简单直观，适合文档片段数量不多的 RAG 场景。
+
+------
+
+## 20.5 FastAPI 类问题
+
+### Q19：FastAPI 在项目中负责什么？
+
+参考回答：
+
+FastAPI 负责提供后端接口，包括上传 PDF、查询支持的模型、检索向量库、聊天问答等。它接收前端请求，调用核心业务函数，然后返回统一格式的响应。
+
+------
+
+### Q20：`@router.post("/chat")` 是什么意思？
+
+参考回答：
+
+这是 FastAPI 的路由装饰器，表示定义一个 POST 类型的 `/chat` 接口。当前端向 `/chat` 发送 POST 请求时，会进入下面对应的函数处理。
+
+------
+
+### Q21：`response_model=StandardAPIResponse` 有什么作用？
+
+参考回答：
+
+它指定接口返回的数据结构必须符合 `StandardAPIResponse` 模型。这样可以统一后端响应格式，也方便 FastAPI 自动生成 API 文档和进行响应校验。
+
+------
+
+### Q22：为什么上传 PDF 接口使用 POST？
+
+参考回答：
+
+上传 PDF 会向服务器提交文件数据，并且会修改服务器状态，例如保存文件、构建向量库，因此应该使用 POST，而不是 GET。
+
+------
+
+### Q23：`UploadFile` 是什么？
+
+参考回答：
+
+`UploadFile` 是 FastAPI 用来接收上传文件的类型。它适合处理文件上传场景，可以读取文件内容、获取文件名、保存文件等。
+
+------
+
+## 20.6 Streamlit 类问题
+
+### Q24：Streamlit 在项目中负责什么？
+
+参考回答：
+
+Streamlit 负责构建前端页面，包括模型选择、PDF 上传、聊天输入、聊天历史展示和 Inspector 检索结果展示。它适合快速构建数据应用和 AI Demo。
+
+------
+
+### Q25：`st.session_state` 有什么作用？
+
+参考回答：
+
+Streamlit 每次交互都会重新运行脚本，因此需要 `st.session_state` 保存跨交互状态，例如聊天历史、当前选择的模型、上传状态等。否则页面刷新后状态会丢失。
+
+------
+
+### Q26：前端为什么不直接做 RAG？
+
+参考回答：
+
+RAG 逻辑涉及文档处理、向量库写入、大模型调用和 API Key 管理，这些更适合放在后端。前端只负责用户交互和结果展示。这样结构更清晰，也更安全。
+
+------
+
+## 20.7 Inspector 类问题
+
+### Q27：Inspector 是干什么的？
+
+参考回答：
+
+Inspector 是向量库检索结果检查器。它不调用大模型，不生成答案，只展示用户 query 从 ChromaDB 中检索出的相关 chunks。它主要用于调试 RAG 系统，判断回答不好是因为检索没找对，还是因为 LLM 没答好。
+
+------
+
+### Q28：为什么调试 RAG 时要先看 Inspector？
+
+参考回答：
+
+因为 RAG 的回答依赖检索结果。如果 Inspector 检索出来的 chunks 不包含答案，那么无论 prompt 怎么改，模型都很难答对。先看 Inspector 可以判断问题是否出在检索阶段。
+
+------
+
+### Q29：如果 Inspector 检索错了，应该怎么排查？
+
+参考回答：
+
+可以检查 PDF 是否解析成功、chunk 是否切得合理、embedding 模型是否合适、Top-k 是否太小、query 表达是否准确、metadata 是否正确保存，以及向量库是否写入了正确内容。
+
+------
+
+## 20.8 工程改进类问题
+
+### Q30：这个项目有哪些不足？
+
+参考回答：
+
+主要不足包括：重复上传同一 PDF 会重复写入；没有用户隔离；没有返回引用来源；没有返回检索分数；没有 rerank；LLM provider 和 embedding provider 耦合；异常处理不够细；没有权限控制和文件安全检查。
+
+------
+
+### Q31：如何避免重复上传导致重复数据？
+
+参考回答：
+
+可以为上传文件计算 hash，例如 SHA256。写入向量库前检查 hash 是否已存在。如果已存在，则不重复写入。也可以使用 source、page、chunk_index 作为唯一标识进行去重。
+
+------
+
+### Q32：如何让回答带引用来源？
+
+参考回答：
+
+可以在 `chain.invoke()` 返回结果中取出 `context` 字段，然后读取每个 Document 的 metadata，例如 source 和 page，再和 answer 一起返回给前端。前端展示回答时显示引用文件和页码。
+
+------
+
+### Q33：如何支持多用户？
+
+参考回答：
+
+需要引入用户系统，并按 user_id 或 project_id 隔离向量库。例如每个用户使用独立 collection 或独立 persist_directory。同时上传文件、检索、删除都要校验用户权限。
+
+------
+
+### Q34：如何提高检索质量？
+
+参考回答：
+
+可以从多个方向优化：调整 chunk_size 和 chunk_overlap；更换 embedding 模型；增大或调整 Top-k；加入 query rewrite；使用 metadata filter；加入 rerank 模型；对 PDF 文本做清洗；支持混合检索，即关键词检索加向量检索。
+
+------
+
+### Q35：如何判断回答不好是检索问题还是生成问题？
+
+参考回答：
+
+先用 Inspector 查看检索出的 chunks。如果 chunks 不包含答案，说明是检索问题；如果 chunks 包含答案但回答不好，说明是 prompt 或 LLM 生成问题。
+
+------
+
+## 20.9 安全方向扩展类问题
+
+### Q36：如果要改造成 Web 漏洞知识库，你会怎么做？
+
+参考回答：
+
+我会保留当前 RAG 工程骨架，将知识库内容替换为 Web 安全文档、CVE 描述、漏洞分析报告、修复建议和 PoC 说明。然后增强 metadata，例如漏洞类型、CVE 编号、风险等级、影响组件等。Prompt 改成漏洞分析助手格式，让系统输出漏洞原理、触发条件、检测思路和修复建议。
+
+------
+
+### Q37：这个系统能不能直接生成攻击 PoC？
+
+参考回答：
+
+系统应定位为安全学习、漏洞分析和修复辅助，而不是自动攻击工具。可以帮助解释漏洞原理、分析代码风险、总结修复建议，但不应设计成自动攻击或批量利用系统。
+
+------
+
+### Q38：Web 漏洞知识库中 metadata 为什么重要？
+
+参考回答：
+
+因为漏洞知识库不仅要检索文本，还需要按漏洞类型、CVE 编号、风险等级、影响组件等维度过滤和组织。metadata 可以提高检索精度，也方便回答时返回可信来源。
+
+------
+
+## 20.10 深入理解类问题
+
+### Q39：为什么不同 embedding 模型的向量库不能混用？
+
+参考回答：
+
+不同 embedding 模型生成的向量维度和语义空间可能不同。如果把不同模型生成的向量混在同一个库中，相似度计算会失去意义，甚至因为维度不一致直接报错。因此向量库应与 embedding 模型绑定。
+
+------
+
+### Q40：LLM provider 和 embedding provider 是一回事吗？
+
+参考回答：
+
+不是。Embedding provider 负责将文本转为向量，用于建库和检索。LLM provider 负责根据 prompt 生成自然语言回答。两者可以来自不同服务。例如使用 HuggingFace embedding 建库，同时使用 Groq LLM 回答。
+
+------
+
+### Q41：RAG 能完全避免幻觉吗？
+
+参考回答：
+
+不能。RAG 可以降低幻觉，因为它给模型提供了外部上下文，但如果检索结果错误、prompt 约束不强，或者模型没有严格依据 context 回答，仍然可能产生幻觉。因此需要引用来源、拒答机制和检索质量评估。
+
+------
+
+### Q42：如果文档中没有答案，系统应该怎么做？
+
+参考回答：
+
+Prompt 中应明确要求：如果 context 中没有相关信息，就回答“文档中没有找到相关信息”。同时可以在后端根据检索相似度阈值判断，如果相关性太低，就直接拒答，避免模型编造。
+
+------
+
+### Q43：如何评估一个 RAG 系统？
+
+参考回答：
+
+可以从检索和生成两个层面评估。检索层面关注 Recall@k、Precision@k、MRR 等指标；生成层面关注答案正确性、忠实性、完整性、引用准确性和幻觉率。工程层面还要关注响应时间、并发能力和稳定性。
+
+------
+
+### Q44：为什么需要持久化向量库？
+
+参考回答：
+
+如果向量库不持久化，每次重启后端都需要重新解析 PDF 和生成 embedding，成本很高。持久化后，上传过的文档可以直接加载，提升效率。
+
+------
+
+### Q45：这个项目每次聊天都重新 build chain，有什么问题？
+
+参考回答：
+
+每次请求都重新构建 chain 会增加开销，尤其是初始化 LLM 或 retriever 时。可以考虑按 provider、model_name 和 vectorstore 缓存 chain，提高性能。但如果向量库发生更新，需要注意缓存失效。
+
+------
+
+## 21. 学完该项目后应能讲清楚的内容
+
+学完本项目后，应能不看代码讲清楚：
+
+```text
+1. 用户上传 PDF 后，系统如何保存、解析、切块、向量化并写入 ChromaDB；
+2. 用户提问后，系统如何加载向量库、创建 retriever、构建 RAG Chain 并调用 LLM；
+3. vectorstore 和 retriever 的区别；
+4. RAG Chain 的组成结构；
+5. Inspector 的作用；
+6. chunk_size、chunk_overlap、Top-k 对回答质量的影响；
+7. FastAPI 后端接口如何与 Streamlit 前端通信；
+8. 项目如何扩展为 Web 漏洞知识库；
+9. 当前项目有哪些工程不足，以及如何改进。
+```
+
+------
+
+## 22. 最终总结
+
+该项目是一个典型的 RAG 工程化入门项目。它通过 FastAPI 提供后端接口，通过 Streamlit 提供前端交互，通过 ChromaDB 存储向量化后的文档 chunks，通过 LangChain 将 Retriever、Prompt 和 LLM 串联成完整 RAG Chain。
+
+项目最核心的两条主线是：
+
+```text
+上传 PDF 主线：
+PDF → 保存 → 解析 → 切块 → embedding → ChromaDB
+
+用户提问主线：
+问题 → retriever 检索 chunks → prompt 拼接 context → LLM 生成 answer
+```
+
+学习该项目时，不能只看页面效果，而要重点理解数据如何流动、文档如何入库、问题如何检索、答案如何生成。真正吃透该项目后，就可以在此基础上扩展出面向 Web 安全方向的漏洞知识库、CVE 问答系统、代码风险分析助手或安全报告生成工具。
